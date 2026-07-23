@@ -1,121 +1,137 @@
-"""Host-side reward stack, v1 = signal quality. Paired, differential, anchored.
+"""The reward, built on one core truth instead of a defended sum of proxies.
 
-Every reward is a *differential* between the operator output and bypass on the
-**same** episode buffer, so episode difficulty cancels and the baseline is never
-recomputed against a different draw. The composition, with the verification's
-corrections baked in:
+Signal quality is **coherence to the clean transmitted waveform** (``recovery.
+coherence``): the fraction of the operator output that is a genuine copy of the
+true signal, after the coherent-receiver nuisance group (gain, phase, timing,
+carrier frequency) is fitted out. The reward is the improvement in that one
+quantity, operator versus bypass, on the same buffer:
 
-- **Fidelity anchor (dominant).** Truth-referenced alignment error to the clean
-  waveform. Immune to gain inflation (scale fitted out) and to content collapse
-  (discarding signal increases the error). This term carries the reward.
-- **Blind ISI differential (secondary, lock-gated).** Counts only where blind
-  recovery reports a lock (converged + residual ISI under threshold), so an
-  unconverged proxy cannot contribute noise.
-- **Blind SNR differential (clamped).** Contribution clipped to +/-1 so the most
-  hackable metric cannot dominate.
-- **Full-band power-conservation penalty.** Punishes gross power change relative
-  to the input, closing the residual gain/noise-floor-sculpting routes.
+    reward = coherence(operator_out, clean) - coherence(bypass, clean)
 
-Non-finite operator output scores a large negative reward, so CMA-ES treats a
-numerically diverged operator as strongly bad rather than being NaN-poisoned.
+Because coherence is gain/phase invariant, collapse-punishing, and
+self-regularizing, every failure mode is closed by the definition rather than by
+a patch. There is no power penalty, no deadzone, no SNR clip, no lock-gate, and
+no weight to tune. A gain-inflated output has identical coherence (reward 0); a
+collapsed output has coherence 0 (reward < 0); an output with added out-of-band
+energy has lower coherence (reward < 0).
+
+Signal-free episodes carry no waveform to be faithful to, so they are simply not
+part of this reward (it returns 0). Honesty on noise is a property of the
+*blind* path below, which is the only path that runs where truth is absent.
+
+The blind path (:func:`blind_episode_reward`) is the hardware reward: it uses the
+CMA recovery proxy because on a real capture there is no clean truth. It is
+credited only when the input itself was recoverable (the bypass locks), a gate
+that is definitional -- you cannot improve the recovery of a signal that was not
+there -- not a patch. Before it is ever trusted, :func:`proxy_validity` certifies
+in sim that it tracks the coherence reward.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
 
-from .recovery import alignment_error, blind_recover
 from .gym import Episode
+from .recovery import blind_recover, coherence
 
 _DIVERGED_REWARD = -10.0
-
-
-@dataclass(frozen=True)
-class RewardConfig:
-    """Weights for the v1 signal-quality reward. Anchor-dominant by design."""
-
-    w_anchor: float = 1.0
-    w_isi: float = 0.3
-    w_snr: float = 0.1
-    snr_clip: float = 1.0
-    w_power: float = 0.5
-    power_deadzone: float = 0.405  # ln(1.5): modest power change is unpenalized
-    isi_lock_threshold: float = 0.22
 
 
 def _finite(x: np.ndarray) -> bool:
     return bool(np.all(np.isfinite(x.view(np.float64))))
 
 
-def stream_reward(
-    operator_out: np.ndarray,
-    bypass_out: np.ndarray,
-    clean: np.ndarray,
-    observed_in: np.ndarray,
-    sps: int,
-    config: RewardConfig = RewardConfig(),
-) -> float:
-    """Differential signal-quality reward for one stream (operator vs bypass)."""
-    operator_out = np.asarray(operator_out, dtype=np.complex128)
-    if not _finite(operator_out):
+# ---------------------------------------------------------------------------
+# the reward: improvement in coherence to the clean waveform (sim / twin)
+# ---------------------------------------------------------------------------
+def episode_reward(operator, episode: Episode) -> float:
+    """Improvement in coherence to the clean waveform, averaged over channels.
+
+    Returns 0 for a signal-free episode (no waveform to be faithful to) and a
+    large negative reward for a numerically diverged operator.
+    """
+    if episode.spec.is_noise:
+        return 0.0
+    observed = episode.observed
+    op_out = operator.forward(observed, episode.spec.fs_hz)
+    if not _finite(op_out):
         return _DIVERGED_REWARD
-
-    # Fidelity anchor: lower alignment error is better, so the improvement is
-    # bypass_error - operator_error.
-    anchor = alignment_error(bypass_out, clean) - alignment_error(operator_out, clean)
-
-    # Blind ISI and SNR differentials, gated on the BYPASS (input) lock -- never
-    # the operator's own output. The operator cannot influence whether its input
-    # was recoverable, so it cannot open this credit channel by shaping its
-    # output (e.g. turning noise into a constant-modulus signal). On a signal-free
-    # probe the input never locks, so neither term can pay out, and the hack is
-    # closed at the source rather than left for the honesty gate to reject.
-    rec_by = blind_recover(bypass_out, sps)
-    if rec_by.locked(config.isi_lock_threshold):
-        rec_op = blind_recover(operator_out, sps)
-        isi = rec_by.residual_isi - rec_op.residual_isi
-        snr = float(np.clip(rec_op.snr_db - rec_by.snr_db, -config.snr_clip, config.snr_clip))
-    else:
-        isi = 0.0
-        snr = 0.0
-
-    # Full-band power conservation penalty relative to the input, with a deadzone
-    # so that legitimate equalization (which changes power modestly) is free while
-    # gross inflation or collapse is punished.
-    p_op = float(np.mean(np.abs(operator_out) ** 2))
-    p_in = float(np.mean(np.abs(observed_in) ** 2))
-    log_ratio = abs(np.log((p_op + 1e-12) / (p_in + 1e-12)))
-    power_penalty = max(0.0, log_ratio - config.power_deadzone)
-
-    return (
-        config.w_anchor * anchor
-        + config.w_isi * isi
-        + config.w_snr * snr
-        - config.w_power * power_penalty
-    )
+    gains = [
+        coherence(op_out[c], episode.clean[c]) - coherence(observed[c], episode.clean[c])
+        for c in range(observed.shape[0])
+    ]
+    return float(np.mean(gains))
 
 
-def episode_reward(operator, episode: Episode, config: RewardConfig = RewardConfig()) -> float:
-    """Mean paired-differential reward over an episode's channels.
+# ---------------------------------------------------------------------------
+# the blind proxy reward (hardware regime, no truth available)
+# ---------------------------------------------------------------------------
+def blind_quality(stream: np.ndarray, sps: int, isi_lock_threshold: float = 0.22):
+    """Blind recovery quality of one stream, plus its lock state.
 
-    ``operator`` is any object with ``forward(iq, fs_hz) -> (channels, N)``.
-    Bypass is the observed input (the identity operator's output).
+    Quality is ``1 / (1 + residual_isi)`` in (0, 1]; higher is better. Returned
+    with the lock flag so the caller can apply the recoverability gate.
+    """
+    rec = blind_recover(stream, sps)
+    return 1.0 / (1.0 + rec.residual_isi), rec.locked(isi_lock_threshold)
+
+
+def blind_episode_reward(operator, episode: Episode) -> float:
+    """Hardware-regime reward: improvement in blind recovery quality.
+
+    Credited per channel only when the *input* (bypass) was recoverable -- a
+    definitional gate the operator cannot open by shaping its own output, so a
+    signal-free capture (whose input never locks) can never pay out.
     """
     observed = episode.observed
-    fs = episode.spec.fs_hz
-    op_out = operator.forward(observed, fs)
+    op_out = operator.forward(observed, episode.spec.fs_hz)
     if not _finite(op_out):
         return _DIVERGED_REWARD
     sps = episode.spec.profile.sps
-    rewards = [
-        stream_reward(op_out[c], observed[c], episode.clean[c], observed[c], sps, config)
-        for c in range(observed.shape[0])
-    ]
-    return float(np.mean(rewards))
+    gains = []
+    for c in range(observed.shape[0]):
+        q_by, by_locked = blind_quality(observed[c], sps)
+        if not by_locked:
+            gains.append(0.0)
+            continue
+        q_op, _ = blind_quality(op_out[c], sps)
+        gains.append(q_op - q_by)
+    return float(np.mean(gains)) if gains else 0.0
 
 
-def probe_reward(operator, noise_episode: Episode, config: RewardConfig = RewardConfig()) -> float:
-    """Reward on a signal-free episode. An honest operator scores ~0; the honesty
-    gate rejects any bank whose magnitude here exceeds a small tolerance."""
-    return episode_reward(operator, noise_episode, config)
+# ---------------------------------------------------------------------------
+# the certificate binding the proxy to the truth
+# ---------------------------------------------------------------------------
+def proxy_validity(
+    operator,
+    gym,
+    n_operators: int = 16,
+    count: int = 8,
+    seed: int = 0,
+    n_samples: int = 1024,
+    spread: float = 0.5,
+) -> float:
+    """Correlation between the truth reward and the blind proxy across an operator
+    *population* -- the certificate that the blind (hardware) reward ranks
+    operators the same way the coherence (truth) reward does.
+
+    A population of operators (``operator`` plus perturbations of its adapted
+    vector) is scored on one fixed episode batch by both rewards; their Pearson
+    correlation is returned. A high value means optimizing the blind reward on
+    hardware optimizes the true signal quality, so the proxy is trustworthy. This
+    single measured guarantee replaces the per-term anti-hacking patches.
+    """
+    rng = np.random.default_rng(seed)
+    episodes = [gym.realize(gym.sample_spec(rng, n_samples=n_samples)) for _ in range(count)]
+    base = operator.adapted_vector()
+    prng = np.random.default_rng(seed + 1)
+    truth, blind = [], []
+    for k in range(n_operators):
+        vec = base if k == 0 else base + prng.standard_normal(base.size) * spread
+        op = operator.with_adapted_vector(vec)
+        truth.append(float(np.mean([episode_reward(op, ep) for ep in episodes])))
+        blind.append(float(np.mean([blind_episode_reward(op, ep) for ep in episodes])))
+    truth = np.asarray(truth)
+    blind = np.asarray(blind)
+    if np.std(truth) < 1e-9 or np.std(blind) < 1e-9:
+        return 0.0
+    return float(np.corrcoef(truth, blind)[0, 1])

@@ -63,21 +63,44 @@ a channel for the fine-tune regime; leave-one-modulation-out builds the G2 split
 
 ## Reward (`recovery.py`, `reward.py`)
 
-Paired differential (operator vs bypass on the *same* buffer). v1 is signal
-quality: a dominant truth-anchored fidelity term (immune to gain inflation and
-content collapse), a lock-gated blind-ISI differential, a clamped blind-SNR term,
-and a deadzoned full-band power-conservation penalty. Signal-free probes gate
-honesty. `tests/test_reward.py` proves both headline hacking routes are rejected.
+One core truth, not a defended sum of proxies. Signal quality is **coherence to
+the clean transmitted waveform** (`recovery.coherence`): the fraction of the
+operator output that is a genuine copy of the true signal after the
+coherent-receiver nuisance group -- gain, carrier phase, timing, carrier
+frequency -- is fitted out. What remains is genuine quality: ISI, noise,
+distortion. The reward is the improvement in that one quantity, operator vs
+bypass on the same buffer.
+
+Because coherence is gain-invariant (`gamma^2 = SNR/(1+SNR)` under noise, so a
+uniform scale is invisible), collapse-punishing (an orthogonal output has
+coherence 0), and self-regularizing (added out-of-band energy raises the norm,
+not the correlation, so coherence falls), every hacking route is closed by the
+definition. There is no power penalty, deadzone, SNR clip, lock-gate, or weight
+to tune -- all of which existed only to defend gameable proxies. `test_reward.py`
+proves each hack fails *by construction*, and that a pure gain earns exactly zero
+without any term to enforce it.
+
+The blind CMA-recovery metrics are not part of this reward. They are the
+*hardware* reward (`blind_episode_reward`), for the regime where the clean truth
+is unavailable, credited only when the input itself was recoverable (a
+definitional gate, not a patch). Before they are trusted, `proxy_validity`
+certifies in sim that the blind reward ranks operators the same way coherence
+does (correlation ~0.55 across the operator population). Signal-free episodes
+carry no waveform, so the truth reward simply excludes them; honesty on noise is
+a property of the blind path, whose recoverability gate makes fabricated
+improvement impossible.
 
 ## Optimizer and gates (`cma.py`, `gates.py`)
 
 CMA-ES (mirrored sampling, common random numbers) over the small adapted vector;
 the parameter map guarantees stable poles and `b <= 0` for any real vector, so
-the search is unconstrained yet always legal. Gates G1 (strict improvement with
-bootstrap CI + effect-size floor), G2 (leave-one-modulation-out non-inferiority),
-G3 (single-violation honesty probes), G4 (quantized realizability). G5 (twin
-acceptance) lives in the twin repo. `tests/test_cma.py` runs a real training loop
-that must actually learn to equalize a planted channel.
+the search is unconstrained yet always legal. Gates G1 (strict coherence
+improvement with bootstrap CI + effect-size floor), G2 (leave-one-modulation-out
+non-inferiority), G3 (single-violation honesty probes on the blind path), G3b
+(proxy validity: the blind reward tracks coherence across the operator space),
+G4 (quantized realizability). G5 (twin acceptance) lives in the twin repo.
+`tests/test_cma.py` runs a real training loop that must actually learn to
+equalize a planted channel (fixed-rate fine-tune reaches ~0.14 coherence gain).
 
 ## Banks (`bank.py`)
 

@@ -49,9 +49,10 @@ class _FixedChannelGym(Gym):
     def sample_spec(self, rng, n_samples=4096, noise_prob=0.0):
         spec = super().sample_spec(rng, n_samples=n_samples, noise_prob=noise_prob)
         from atom_neural_rl.gym import EpisodeSpec
+        from atom_neural_rl.zplane import F0_HZ
         return EpisodeSpec(
             profile=self.catalog[0], channel=self._chan,
-            fs_hz=spec.fs_hz, n_samples=n_samples, seed=spec.seed,
+            fs_hz=F0_HZ, n_samples=n_samples, seed=spec.seed,
             n_channels=1, is_noise=spec.is_noise,
         )
 
@@ -67,7 +68,8 @@ class TheStackLearns(unittest.TestCase):
             generations=18, batch=6, n_samples=1024,
             sigma0=0.3, popsize=12, seed=3,
         )
-        # Warm-start baseline reward is ~0 (H == 1); training must lift it clearly.
+        # Warm-start baseline coherence reward is ~0 (H == 1); training must lift
+        # it clearly (fixed-rate fine-tune reaches ~0.14 coherence gain).
         self.assertGreater(history.best_reward, 0.03,
                            msg=f"training did not learn: {history.validation_reward}")
         # The improvement must be retained, not a single-generation spike that
@@ -75,7 +77,7 @@ class TheStackLearns(unittest.TestCase):
         # reward can peak then settle, and the exact path varies with the numpy
         # RNG version across the Python matrix.)
         late = float(np.mean(history.validation_reward[-3:]))
-        self.assertGreater(late, 0.008,
+        self.assertGreater(late, 0.02,
                            msg=f"learning not retained: {history.validation_reward}")
 
 

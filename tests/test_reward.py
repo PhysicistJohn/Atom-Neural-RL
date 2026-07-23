@@ -1,4 +1,9 @@
-"""Reward stack: anchoring, and rejection of the two headline hacking routes."""
+"""The core-truth reward: coherence, and why every hack fails by construction.
+
+These tests assert that the *definition* of the reward -- improvement in
+coherence to the clean waveform -- makes the reward-hacking routes impossible,
+without any penalty, clip, deadzone, or lock-gate defending it.
+"""
 from __future__ import annotations
 
 import unittest
@@ -6,83 +11,127 @@ import unittest
 import numpy as np
 
 from atom_neural_rl.gym import Gym
-from atom_neural_rl.recovery import alignment_error
-from atom_neural_rl.reward import RewardConfig, episode_reward, stream_reward
 from atom_neural_rl.operator import NeuralOperator, OperatorConfig
+from atom_neural_rl.recovery import coherence
+from atom_neural_rl.reward import episode_reward
 from atom_neural_rl.zplane import F0_HZ
 
 
-class AlignmentError(unittest.TestCase):
-    def test_perfect_match_is_zero(self) -> None:
+class CoherenceIsTheCoreTruth(unittest.TestCase):
+    def test_perfect_copy_is_one(self) -> None:
         rng = np.random.default_rng(0)
-        x = rng.standard_normal(512) + 1j * rng.standard_normal(512)
-        self.assertLess(alignment_error(x, x), 1e-12)
+        x = rng.standard_normal(1024) + 1j * rng.standard_normal(1024)
+        self.assertAlmostEqual(coherence(x, x), 1.0, places=6)
 
-    def test_scale_and_phase_invariant(self) -> None:
+    def test_invariant_to_gain_phase_delay_cfo(self) -> None:
         rng = np.random.default_rng(1)
-        x = rng.standard_normal(512) + 1j * rng.standard_normal(512)
-        scaled = 7.0 * np.exp(1j * 1.1) * x
-        self.assertLess(alignment_error(scaled, x), 1e-9)
+        n = 1024
+        x = rng.standard_normal(n) + 1j * rng.standard_normal(n)
+        gain_phase = 9.0 * np.exp(1j * 2.1) * x
+        cfo = x * np.exp(2j * np.pi * 1.5 * np.arange(n) / n)
+        self.assertGreater(coherence(gain_phase, x), 0.999)
+        self.assertGreater(coherence(np.roll(x, 6), x), 0.99)
+        self.assertGreater(coherence(cfo, x), 0.999)
 
-    def test_zero_estimate_is_worst(self) -> None:
+    def test_noise_lowers_coherence_monotonically(self) -> None:
         rng = np.random.default_rng(2)
-        x = rng.standard_normal(256) + 1j * rng.standard_normal(256)
-        self.assertEqual(alignment_error(np.zeros(256, dtype=complex), x), 1.0)
+        n = 2048
+        x = (rng.standard_normal(n) + 1j * rng.standard_normal(n)) / np.sqrt(2)
+        prev = 1.0
+        for snr in (30.0, 20.0, 10.0, 3.0):
+            noise = (rng.standard_normal(n) + 1j * rng.standard_normal(n)) / np.sqrt(2)
+            noise *= np.sqrt(10 ** (-snr / 10))
+            g = coherence(x + noise, x)
+            self.assertLess(g, prev)
+            prev = g
 
-
-class RewardHackingRoutes(unittest.TestCase):
-    def _stream(self, op, by, clean, obs, sps=4):
-        return stream_reward(op, by, clean, obs, sps)
-
-    def test_perfect_operator_beats_bypass(self) -> None:
-        # operator_out == clean should score strongly positive vs a distorted bypass.
+    def test_collapse_and_orthogonal_are_zero(self) -> None:
         rng = np.random.default_rng(3)
-        clean = (rng.standard_normal(1024) + 1j * rng.standard_normal(1024)) / np.sqrt(2)
-        distorted = clean + 0.5 * (rng.standard_normal(1024) + 1j * rng.standard_normal(1024)) / np.sqrt(2)
-        reward = self._stream(clean, distorted, clean, distorted)
-        self.assertGreater(reward, 0.1)
+        x = rng.standard_normal(1024) + 1j * rng.standard_normal(1024)
+        self.assertEqual(coherence(np.zeros(1024, dtype=complex), x), 0.0)
+        orthogonal = rng.standard_normal(1024) + 1j * rng.standard_normal(1024)
+        self.assertLess(coherence(orthogonal, x), 0.05)
 
-    def test_gain_inflation_is_not_rewarded(self) -> None:
-        # Scaling the input by a big constant must not earn reward (anchor is
-        # scale-invariant; the power penalty punishes the inflation).
-        rng = np.random.default_rng(4)
-        clean = (rng.standard_normal(1024) + 1j * rng.standard_normal(1024)) / np.sqrt(2)
-        observed = clean + 0.3 * (rng.standard_normal(1024) + 1j * rng.standard_normal(1024)) / np.sqrt(2)
-        inflated = 12.0 * observed
-        reward = self._stream(inflated, observed, clean, observed)
-        self.assertLessEqual(reward, 0.02)
 
-    def test_content_collapse_is_rejected(self) -> None:
-        # Replacing the signal with near-zero (or a lone tone) must score negative.
-        rng = np.random.default_rng(5)
-        clean = (rng.standard_normal(1024) + 1j * rng.standard_normal(1024)) / np.sqrt(2)
-        observed = clean + 0.3 * (rng.standard_normal(1024) + 1j * rng.standard_normal(1024)) / np.sqrt(2)
-        collapsed = 1e-3 * observed  # signal thrown away
-        self.assertLess(self._stream(collapsed, observed, clean, observed), 0.0)
+class _ScaleOperator:
+    """A fake operator that just multiplies its input by a constant (gain hack)."""
+
+    def __init__(self, config, factor):
+        self.config = config
+        self.factor = factor
+
+    def forward(self, iq, fs_hz):
+        return self.factor * np.asarray(iq, dtype=np.complex128)
+
+
+class _CollapseOperator:
+    """Discards the signal structure -- replaces it with a lone constant tone.
+
+    (Merely scaling the input is *not* collapse: coherence is gain-invariant, so
+    a uniform scale scores exactly 0. Collapse means destroying the waveform.)
+    """
+
+    def __init__(self, config):
+        self.config = config
+
+    def forward(self, iq, fs_hz):
+        iq = np.asarray(iq, dtype=np.complex128)
+        n = iq.shape[-1]
+        tone = np.exp(2j * np.pi * 0.1 * np.arange(n))
+        return np.broadcast_to(tone, iq.shape).copy()
+
+
+class HacksFailByConstruction(unittest.TestCase):
+    def setUp(self) -> None:
+        self.gym = Gym()
+        self.rng = np.random.default_rng(4)
+        self.ep = self.gym.realize(self.gym.sample_spec(self.rng, n_samples=2048))
+        self.cfg = OperatorConfig.diagonal_for_channels(1)
+
+    def test_identity_scores_zero(self) -> None:
+        op = NeuralOperator.identity(self.cfg)
+        self.assertAlmostEqual(episode_reward(op, self.ep), 0.0, delta=1e-6)
+
+    def test_gain_inflation_earns_nothing(self) -> None:
+        # A 20x gain has identical coherence to the input, so reward == 0.
+        op = _ScaleOperator(self.cfg, 20.0)
+        self.assertAlmostEqual(episode_reward(op, self.ep), 0.0, delta=1e-6)
+
+    def test_content_collapse_is_punished(self) -> None:
+        op = _CollapseOperator(self.cfg)
+        self.assertLess(episode_reward(op, self.ep), 0.0)
+
+    def test_uniform_scale_is_neither_rewarded_nor_punished(self) -> None:
+        # The elegance check: a pure gain is invisible to coherence, so it earns
+        # exactly nothing -- no penalty needed to make this true.
+        self.assertAlmostEqual(episode_reward(_ScaleOperator(self.cfg, 0.01), self.ep),
+                               0.0, delta=1e-6)
+
+    def test_perfect_operator_earns_positive(self) -> None:
+        # An operator that outputs the clean waveform maximizes coherence.
+        clean = self.ep.clean
+
+        class _Oracle:
+            config = self.cfg
+            def forward(self, iq, fs_hz):
+                return clean
+        self.assertGreater(episode_reward(_Oracle(), self.ep), 0.05)
+
+    def test_noise_episode_scores_zero(self) -> None:
+        spec = self.gym.sample_spec(self.rng, n_samples=2048, noise_prob=1.0)
+        ep = self.gym.realize(spec)
+        op = NeuralOperator.identity(self.cfg).with_adapted_vector(
+            self.rng.standard_normal(self.cfg.adapted_dim) * 0.3
+        )
+        # No clean waveform to be faithful to -> reward is exactly 0, for any op.
+        self.assertEqual(episode_reward(op, ep), 0.0)
 
     def test_diverged_output_scores_worst(self) -> None:
-        clean = np.ones(64, dtype=complex)
-        observed = np.ones(64, dtype=complex)
-        bad = np.full(64, np.nan + 1j * np.nan)
-        self.assertLessEqual(self._stream(bad, observed, clean, observed), -1.0)
-
-
-class ProbeAndIdentity(unittest.TestCase):
-    def test_identity_operator_scores_near_zero_on_signal(self) -> None:
-        gym = Gym()
-        rng = np.random.default_rng(6)
-        ep = gym.realize(gym.sample_spec(rng, n_samples=2048))
-        op = NeuralOperator.identity(OperatorConfig.diagonal_for_channels(1))
-        # Identity: op_out == observed == bypass, so the differential is ~0.
-        self.assertAlmostEqual(episode_reward(op, ep), 0.0, delta=1e-6)
-
-    def test_identity_probe_is_zero_on_noise(self) -> None:
-        gym = Gym()
-        rng = np.random.default_rng(7)
-        spec = gym.sample_spec(rng, n_samples=2048, noise_prob=1.0)
-        ep = gym.realize(spec)
-        op = NeuralOperator.identity(OperatorConfig.diagonal_for_channels(1))
-        self.assertAlmostEqual(episode_reward(op, ep), 0.0, delta=1e-6)
+        class _Diverged:
+            config = self.cfg
+            def forward(self, iq, fs_hz):
+                return np.full_like(np.asarray(iq, dtype=complex), np.nan)
+        self.assertLessEqual(episode_reward(_Diverged(), self.ep), -1.0)
 
 
 if __name__ == "__main__":

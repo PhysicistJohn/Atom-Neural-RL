@@ -1,20 +1,26 @@
-"""Blind recovery and fidelity metrics -- the reward judges.
+"""Fidelity to the clean waveform (the core truth) and blind recovery (the proxy).
 
-Two families of metric, matching the design:
+Two families of metric, and the relationship between them is the whole point:
 
-- **Truth-anchored fidelity** (:func:`alignment_error`): the normalized residual
-  after fitting the single complex scale and integer delay that best match an
-  estimate to the known clean waveform. This is the mandatory data-fidelity
-  anchor. It is immune to gain inflation (the scale is fitted out) and it
-  punishes content collapse (notching signal away increases the residual toward
-  the clean truth). Available wherever ground truth exists: sim and twin.
+- **Coherence** (:func:`coherence`) is the core truth. It is the fraction of the
+  operator output that is a genuine copy of the clean transmitted waveform, after
+  maximizing over exactly the transformations a coherent receiver removes for
+  free: complex gain (carrier phase + amplitude), timing (integer delay), and
+  carrier frequency offset. What remains -- intersymbol interference, noise,
+  distortion -- is genuine signal quality. This single quantity is, by
+  construction, invariant to gain inflation (the gain is fitted out), punishing
+  of content collapse (an output orthogonal to the truth has coherence zero), and
+  self-regularizing (any added out-of-band energy raises the output norm without
+  raising the correlation, so coherence falls). No penalty, deadzone, clip, or
+  lock-gate is needed around it. Available wherever ground truth exists: sim and
+  twin.
 
-- **Blind recovery** (:func:`blind_recover`): a fractionally-spaced CMA equalizer
-  with a convergence indicator and a blind modulus-dispersion ISI proxy and a
-  PSD-floor SNR estimate. This is the judge that works on real captures with no
-  truth. It is a Python port of the classifier's recovery path; parity with the
-  TypeScript reference is a separate blocking golden gate (``scripts/ts_parity``)
-  and is not asserted numerically here.
+- **Blind recovery** (:func:`blind_recover`) is a proxy for the core truth, for
+  the hardware regime where the clean waveform is unavailable. It is a
+  fractionally-spaced CMA equalizer with a convergence indicator and a blind
+  modulus-dispersion ISI proxy. It is trusted only after ``reward.proxy_validity``
+  certifies in sim that it tracks the coherence reward; parity with the classifier's
+  TypeScript reference is a separate blocking golden gate.
 
 Everything operates per stream; callers average over the channel dimension.
 """
@@ -26,36 +32,77 @@ import numpy as np
 
 
 # ---------------------------------------------------------------------------
-# truth-anchored fidelity
+# the core truth: coherence to the clean waveform
 # ---------------------------------------------------------------------------
-def alignment_error(estimate: np.ndarray, reference: np.ndarray, max_delay: int = 24) -> float:
-    """Normalized residual after the best complex-scale + integer-delay fit.
+def _shift(x: np.ndarray, d: int) -> np.ndarray:
+    """A true (non-circular) integer shift: vacated samples are zeroed."""
+    y = np.roll(x, d)
+    if d > 0:
+        y[:d] = 0.0
+    elif d < 0:
+        y[d:] = 0.0
+    return y
 
-    ``0`` is a perfect match to ``reference`` up to gain/phase/delay; ``~1`` is
-    uncorrelated. Gain- and phase-invariant by construction.
+
+def _estimate_cfo_bins(z: np.ndarray, ref: np.ndarray) -> float:
+    """Carrier frequency offset (in DFT bins) between ``z`` and ``ref``.
+
+    The cross-product ``z * conj(ref)`` has a spectral line at the offset; its
+    peak, refined by parabolic interpolation for sub-bin resolution, is the CFO.
     """
-    estimate = np.asarray(estimate, dtype=np.complex128)
-    reference = np.asarray(reference, dtype=np.complex128)
-    n = estimate.size
-    est_energy = float(np.vdot(estimate, estimate).real)
-    if est_energy <= 0.0:
-        return 1.0
-    best = 1.0
-    for d in range(-max_delay, max_delay + 1):
-        ref = np.roll(reference, d)
-        # zero the wrapped region so the delay is a true shift, not circular
-        if d > 0:
-            ref[:d] = 0.0
-        elif d < 0:
-            ref[d:] = 0.0
-        ref_energy = float(np.vdot(ref, ref).real)
-        if ref_energy <= 0.0:
-            continue
-        a = np.vdot(ref, estimate) / ref_energy  # optimal complex scale
-        residual = estimate - a * ref
-        err = float(np.vdot(residual, residual).real) / est_energy
-        best = min(best, err)
-    return best
+    w = z * np.conj(ref)
+    mag = np.abs(np.fft.fft(w))
+    n = mag.size
+    k = int(np.argmax(mag))
+    a, b, c = mag[(k - 1) % n], mag[k], mag[(k + 1) % n]
+    denom = a - 2 * b + c
+    delta = 0.5 * (a - c) / denom if denom != 0 else 0.0
+    freq = k + delta
+    return freq - n if freq > n / 2 else freq
+
+
+def coherence(estimate: np.ndarray, reference: np.ndarray, max_delay: int = 24) -> float:
+    """Coherence ``gamma^2`` in [0, 1] to ``reference``, maximized over the
+    coherent-receiver nuisance group (gain, phase, delay, carrier frequency).
+
+    ``1`` means the estimate is exactly a gain/phase/delay/CFO transform of the
+    reference (perfect fidelity); ``0`` means orthogonal (no signal). This is the
+    core signal-quality quantity; the reward is its improvement.
+    """
+    z = np.asarray(estimate, dtype=np.complex128)
+    x = np.asarray(reference, dtype=np.complex128)
+    zz = float(np.vdot(z, z).real)
+    if zz <= 0.0 or x.size == 0:
+        return 0.0
+
+    def best_over_delay(xr: np.ndarray) -> tuple[float, int]:
+        best, best_d = 0.0, 0
+        for d in range(-max_delay, max_delay + 1):
+            xd = _shift(xr, d)
+            xx = float(np.vdot(xd, xd).real)
+            if xx <= 0.0:
+                continue
+            g2 = float(np.abs(np.vdot(xd, z)) ** 2 / (xx * zz))
+            if g2 > best:
+                best, best_d = g2, d
+        return best, best_d
+
+    # Coarse alignment at zero CFO, then estimate and remove the CFO, then refine.
+    coarse, d0 = best_over_delay(x)
+    n = z.size
+    freq = _estimate_cfo_bins(z, _shift(x, d0))
+    xr = x * np.exp(2j * np.pi * freq * np.arange(n) / n)
+    refined, _ = best_over_delay(xr)
+    return float(min(max(coarse, refined), 1.0))
+
+
+def alignment_error(estimate: np.ndarray, reference: np.ndarray, max_delay: int = 24) -> float:
+    """``1 - coherence``: the fraction of the estimate not explained by the truth.
+
+    Retained as the complementary view of :func:`coherence`; ``0`` is a perfect
+    match, ``1`` uncorrelated.
+    """
+    return 1.0 - coherence(estimate, reference, max_delay)
 
 
 # ---------------------------------------------------------------------------

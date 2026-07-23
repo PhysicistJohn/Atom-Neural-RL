@@ -6,9 +6,14 @@
 - **G2 non-inferiority.** On a left-out modulation (leave-one-modulation-out),
   the reward's one-sided lower CI must sit above ``-delta``: the bank may not
   quietly regress a modulation it never trained on.
-- **G3 honesty probes.** On signal-free episodes an honest operator scores ~0.
-  A single probe exceeding tolerance fails the gate (probes are cheap; there is
-  no averaging away a fabricated improvement).
+- **G3 honesty probes.** On signal-free episodes the *blind* (hardware) reward of
+  an honest operator scores ~0; a single probe exceeding tolerance fails. Honesty
+  is a property of the blind path -- the only path that runs where truth is
+  absent -- not of the coherence reward, which simply excludes noise.
+- **G3b proxy validity.** The blind (hardware) reward must track the coherence
+  (truth) reward in sim above a correlation floor, so hardware fine-tuning against
+  the proxy is trustworthy. This is the certificate that replaces per-term
+  anti-hacking patches.
 - **G4 quantized realizability.** The fixed-point table deviates from the float
   response by less than tolerance across FFT sizes, and every pole radius is
   within the fabric cap on the *quantized* kernel.
@@ -25,6 +30,7 @@ import numpy as np
 
 from .fixedpoint import quantize_table
 from .gym import Gym
+from .reward import blind_episode_reward, proxy_validity
 from .zplane import RHO_MAX
 
 
@@ -115,6 +121,16 @@ def gate_g3(probe_rewards: np.ndarray, eps: float) -> GateReport:
     )
 
 
+def gate_proxy(correlation: float, floor: float = 0.35) -> GateReport:
+    passed = correlation >= floor
+    return GateReport(
+        "G3b-proxy-validity",
+        passed,
+        f"corr(truth, blind)={correlation:.3f} >= floor={floor}",
+        {"correlation": correlation},
+    )
+
+
 def gate_g4(operator, sizes=(1024, 4096, 16384), tol_db: float = -60.0,
             pole_cap: float = RHO_MAX) -> GateReport:
     worst_dev_db = -np.inf
@@ -153,16 +169,21 @@ def run_gates(
 ) -> PromotionReport:
     """Evaluate all four gates and return the aggregate promotion decision."""
     train_gym, held_gym = gym.leave_one_modulation_out(held_out_modulation)
+    # G1/G2 on the coherence (truth) reward.
     train_rewards = _rewards(operator, train_gym, reward_fn, eval_count, seed + 1, n_samples)
     held_rewards = _rewards(operator, held_gym, reward_fn, eval_count, seed + 2, n_samples)
+    # G3 honesty on the blind (hardware) reward -- the path that runs without truth.
     probe_rewards = _rewards(
-        operator, train_gym, reward_fn, probe_count, seed + 3, n_samples, noise_prob=1.0
+        operator, train_gym, blind_episode_reward, probe_count, seed + 3, n_samples, noise_prob=1.0
     )
+    # G3b: the blind proxy must track the truth reward across the operator space.
+    correlation = proxy_validity(operator, train_gym, seed=seed + 4, n_samples=n_samples)
     return PromotionReport(
         gates=[
             gate_g1(train_rewards, g1_floor, seed=seed + 11),
             gate_g2(held_rewards, g2_delta, seed=seed + 12),
             gate_g3(probe_rewards, g3_eps),
+            gate_proxy(correlation),
             gate_g4(operator),
         ]
     )

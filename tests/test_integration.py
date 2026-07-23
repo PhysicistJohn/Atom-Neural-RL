@@ -18,7 +18,7 @@ from atom_neural_rl.cma import train_operator
 from atom_neural_rl.gates import gate_g1, gate_g3, gate_g4, _rewards
 from atom_neural_rl.gym import Gym, EpisodeSpec
 from atom_neural_rl.operator import NeuralOperator, OperatorConfig
-from atom_neural_rl.reward import episode_reward
+from atom_neural_rl.reward import blind_episode_reward, episode_reward, proxy_validity
 from atom_neural_rl.waveforms import WaveformProfile
 from atom_neural_rl.zplane import F0_HZ
 
@@ -58,16 +58,22 @@ class EndToEnd(unittest.TestCase):
         np.testing.assert_allclose(operator.forward(iq, fs),
                                    reloaded.forward(iq, fs), atol=1e-9)
 
-        # G1: strict improvement on the trained channel distribution.
+        # G1: strict improvement in coherence on the trained channel distribution.
         train_rewards = _rewards(reloaded, gym, episode_reward, count=40, seed=7, n_samples=1024)
         self.assertTrue(gate_g1(train_rewards, floor=0.01).passed,
                         msg=f"G1 failed: mean={np.mean(train_rewards):.4f}")
 
-        # G3: honesty on signal-free probes.
-        probes = _rewards(reloaded, gym, episode_reward, count=16, seed=8,
+        # G3: honesty on the blind (hardware) reward over signal-free probes.
+        probes = _rewards(reloaded, gym, blind_episode_reward, count=16, seed=8,
                           n_samples=1024, noise_prob=1.0)
         self.assertTrue(gate_g3(probes, eps=0.02).passed,
-                        msg=f"G3 failed: worst={np.max(np.abs(probes)):.4f}")
+                        msg=f"G3 failed: worst={np.max(probes):.4f}")
+
+        # G3b: the blind proxy tracks the coherence truth reward across the
+        # operator space -- measured on a diverse gym (a single fixed channel has
+        # no quality spread to correlate).
+        corr = proxy_validity(reloaded, Gym(), seed=9, n_samples=1024)
+        self.assertGreater(corr, 0.3, msg=f"proxy validity too low: {corr:.3f}")
 
         # G4: quantized realizability.
         self.assertTrue(gate_g4(reloaded).passed)
