@@ -134,5 +134,32 @@ class HacksFailByConstruction(unittest.TestCase):
         self.assertLessEqual(episode_reward(_Diverged(), self.ep), -1.0)
 
 
+class ProxyMechanismIsSound(unittest.TestCase):
+    """The blind proxy tracks the coherence truth along a controlled quality
+    ladder -- proven deterministically, without trained-operator sampling noise."""
+
+    def test_both_metrics_rank_a_noise_ladder_consistently(self) -> None:
+        from atom_neural_rl.recovery import blind_recover, coherence
+        from atom_neural_rl.reward import blind_quality
+        from atom_neural_rl.waveforms import WaveformProfile, synthesize
+
+        prof = WaveformProfile("qpsk", sps=4, rolloff=0.35)
+        clean = synthesize(prof, 2048, seed=0).iq
+        rng = np.random.default_rng(1)
+        truth, blind = [], []
+        for snr_db in (30, 24, 18, 12, 8, 4):  # decreasing quality
+            noise = (rng.standard_normal(clean.size) + 1j * rng.standard_normal(clean.size))
+            noise *= np.sqrt(10 ** (-snr_db / 10) / 2)
+            z = clean + noise
+            truth.append(coherence(z, clean))
+            blind.append(blind_quality(z, prof.sps)[0])
+        # Both must be (weakly) monotone decreasing with SNR, so their rank
+        # correlation is strongly positive.
+        tr = np.argsort(np.argsort(truth))
+        br = np.argsort(np.argsort(blind))
+        r = float(np.corrcoef(tr, br)[0, 1])
+        self.assertGreater(r, 0.8, msg=f"blind proxy does not track truth: r={r:.2f}")
+
+
 if __name__ == "__main__":
     unittest.main()
