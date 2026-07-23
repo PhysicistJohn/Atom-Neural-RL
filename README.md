@@ -35,3 +35,18 @@ tables.
 Phase P1: design spec signed off; reference implementation in progress. The
 design document (three lanes, independently adversarially verified) governs
 this repository.
+
+## Reproduce
+
+```
+PYTHONPATH=src python3 -m unittest discover -s tests   # full suite (108 tests)
+PYTHONPATH=src python3 -m atom_neural_rl.cli verify-invariance
+scripts/check.sh                                        # the CI source gate
+```
+
+`golden.py` is the normative fixed-point reference; its pinned vector digests
+are reproduced bit-for-bit by the C twin core, the RTL, and the QEMU operator
+device (see the operator chain in
+[`Atom-NeptuneSDR-Twin/cosim/REPRODUCE.md`](https://github.com/PhysicistJohn/Atom-NeptuneSDR-Twin/blob/main/cosim/REPRODUCE.md)).
+Design: [`docs/DESIGN.md`](docs/DESIGN.md); day-one hardware runbook:
+[`docs/DAY_ONE.md`](docs/DAY_ONE.md).
