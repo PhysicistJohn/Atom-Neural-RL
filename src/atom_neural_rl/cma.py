@@ -82,7 +82,7 @@ class CMAES:
         order = np.argsort(fitnesses)
         y = self._last[order]
         y_mu = y[: self.mu]
-        y_w = self.weights @ y_mu  # recombined step (in y-space)
+        y_w = np.einsum("i,in->n", self.weights, y_mu)  # recombined step (einsum: warning-clean)
         self.mean = self.mean + self.sigma * y_w
 
         self.ps = (1 - self.cs) * self.ps + np.sqrt(
