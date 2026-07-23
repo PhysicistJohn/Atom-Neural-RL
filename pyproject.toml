@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atom-neural-rl"
+version = "0.1.0"
+description = "z-plane invariant complex Fourier neural operator for the NeptuneSDR/P210, learned under RL"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Atom-Neural-RL contributors" }]
+dependencies = ["numpy>=1.23"]
+
+[project.optional-dependencies]
+# Gradient pretraining backend (Section: learning ladder). Not required for the
+# CMA-ES path, which is gradient-free and is the normative optimizer for both
+# sim and hardware-in-the-loop. Absence of JAX never blocks the test suite.
+pretrain = ["jax>=0.4", "jaxlib>=0.4"]
+
+[project.scripts]
+atom-neural-rl = "atom_neural_rl.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+atom_neural_rl = ["py.typed"]
