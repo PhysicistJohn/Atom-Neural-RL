@@ -38,8 +38,12 @@ this repository.
 
 ## Reproduce
 
+Requirements: Python >= 3.9. numpy is the only runtime dependency, and it is
+installed for you by the editable install below.
+
 ```
-PYTHONPATH=src python3 -m unittest discover -s tests   # full suite (108 tests)
+python3 -m pip install -e .                             # install (numpy only)
+PYTHONPATH=src python3 -m unittest discover -s tests    # full suite (114 tests, ~1.5 min)
 PYTHONPATH=src python3 -m atom_neural_rl.cli verify-invariance
 scripts/check.sh                                        # the CI source gate
 ```

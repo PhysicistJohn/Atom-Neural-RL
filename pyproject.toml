@@ -25,4 +25,4 @@ atom-neural-rl = "atom_neural_rl.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-atom_neural_rl = ["py.typed"]
+atom_neural_rl = ["py.typed", "data/*.bin"]
